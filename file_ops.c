@@ -8,11 +8,11 @@ int read_code(unsigned* pycbuf, struct code_obj* pobj, int cur, int size);
 struct obj* init_obj(void)
 {
     struct obj* pobj = malloc(sizeof *pobj);
-    pobj->type = 69;
+    pobj->type = TYPE_INTEGER;
     return pobj;
 }
 
-void store_val(struct field* pycfield, int data)
+void field_add(struct field* pycfield, int data)
 {
     int length = pycfield->length;
     if (length < MAXVAL)
@@ -20,17 +20,45 @@ void store_val(struct field* pycfield, int data)
     pycfield->length++;
 }
 
+int have_arg(unsigned opcode)
+{
+    if (opcode < HAVE_ARG)
+        return FALSE;
+    else
+        return TRUE;
+}
+
+int find_start(unsigned* pycbuf, int start)
+{
+    for(; !(pycbuf[start] == TYPE_CODE && pycbuf[start+17] == TYPE_STRING); start++);
+    return start+22;
+}
+
 int find_start_of_this_code(unsigned* pycbuf, int cur)
 {
-    int nxt;
     while(pycbuf[cur] != TYPE_CODE && cur > 0)
         cur--;
     if (cur <= 0)
-	nxt = 0;
-        for(;!(pycbuf[nxt] == TYPE_CODE && pycbuf[nxt+17] == TYPE_STRING);nxt++);
-    	nxt = nxt+22;
-	return nxt;
+        return find_start(pycbuf, 0);
     return cur + 22;
+}
+
+int find_next_callable(unsigned* pycbuf, int start, int num)
+{
+    while(num--) 
+    {
+        start++;
+        start = find_start(pycbuf, start);
+    }
+    return start;  
+}
+
+int callable(int cur, unsigned* pycbuf)
+{
+    if (pycbuf[cur] == LOAD_CONSTANT && pycbuf[cur+3] == MAKE_FUNCTION)
+        return TRUE;
+    else
+        return FALSE;
 }
 
 int compute_offset(unsigned* pycbuf, int cur, int target)
@@ -43,8 +71,9 @@ int compute_offset(unsigned* pycbuf, int cur, int target)
         end = cur + 3 + target;
     else
         cur = start;
-    while(cur < end) {
-        if(pycbuf[cur] > 90) 
+    while(cur < end) 
+    {
+        if(have_arg(pycbuf[cur])) 
 	{
             offset += 2;
             cur += 3;
@@ -58,42 +87,40 @@ int compute_offset(unsigned* pycbuf, int cur, int target)
     return offset;
 }
 
+int length(unsigned* pycbuf, int cur) 
+{
+    int len = pycbuf[cur+1] | pycbuf[cur+2] << 8 | pycbuf[cur+3] << 16 | pycbuf[cur+4] << 24; 
+    return len ;
+}
+
+int get_op_arg(unsigned* pycbuf, int cur)
+{
+    int l = pycbuf[cur+1];
+    int m = pycbuf[cur+2];
+    int oparg = l | m << 8; 
+    int opcode = pycbuf[cur];
+    if(opcode >= JUMP_FORWARD && opcode <= POP_JUMP_IF_TRUE)
+        oparg = compute_offset(pycbuf, cur, oparg);
+    return oparg;
+}
+
 int get_code(unsigned* pycbuf, struct code_obj* pobj, int cur, int size)
 {
     int func_idx = 0;
     int op_arg = 0;
     int num_obj = 1;
-    int len = pycbuf[cur+1] | pycbuf[cur+2] << 8 | pycbuf[cur+3] << 16 | pycbuf[cur+4] << 24; 
+    int d = 0;
+    int len = length(pycbuf, cur-5);
     int end = cur + len;
-    while (cur < end-1 && !(cur >= size)) 
-    {
-	if(pycbuf[cur] == LOAD_CONSTANT && pycbuf[cur+3] == MAKE_FUNCTION)
+    while(cur < end-1 && !(cur >= size)) 
 	{
-	    int nxt = cur,num = num_obj;
-	    while(num--) 
-	    {
-        	nxt++;
-		for(;!(pycbuf[nxt] == TYPE_CODE && pycbuf[nxt+17] == TYPE_STRING);nxt++);
-    		nxt = nxt+22;
-    	    }
-            struct code_obj* pnew_obj = malloc(sizeof(*pnew_obj));
-            func_idx = read_code(pycbuf,pnew_obj,nxt,size); 
-            objects[func_idx]->val.pobj = pnew_obj;
-            objects[func_idx]->type = TYPE_CODE;
-            num_obj++;
-            cur += 9; 
-        }
-	else 
+        if(!(callable(cur, pycbuf))) 
 	{
-            store_val(&(pobj->code),pycbuf[cur]);
-            if(pycbuf[cur] > 90)  //Arguments
+            field_add(&(pobj->code), pycbuf[cur]);
+            if(have_arg(pycbuf[cur])) 
 	    {
-      		int oparg = pycbuf[cur+1] | pycbuf[cur+2] << 8; 
-    		int opcode = pycbuf[cur];
-    		if (opcode >= JUMP_FORWARD && opcode <= POP_JUMP_IF_TRUE)
-       			oparg = compute_offset(pycbuf, cur, oparg);
-    		op_arg = oparg;
-                store_val(&(pobj->code),op_arg);
+                op_arg = get_op_arg(pycbuf, cur);
+                field_add(&(pobj->code), op_arg);
                 cur += 3;
             } 
 	    else 
@@ -101,76 +128,101 @@ int get_code(unsigned* pycbuf, struct code_obj* pobj, int cur, int size)
                 cur += 1; 
             }
         } 
+	else 
+	{
+            d = find_next_callable(pycbuf, cur, num_obj);
+            struct code_obj* pnew_obj = malloc(sizeof(*pnew_obj));
+            func_idx = read_code(pycbuf, pnew_obj, d, size); 
+            objects[func_idx]->val.pobj =  pnew_obj;
+            objects[func_idx]->type =  TYPE_CODE;
+            num_obj++;
+            cur += 9; 
+        }
     }
-    store_val(&(pobj->code), pycbuf[cur]);
+    field_add(&(pobj->code), pycbuf[cur]);
     return cur+1; 
 }
 
-int pos(unsigned* pycbuf, int cur)
+int skip_element(unsigned* pycbuf, int cur)
+{
+    int len = length(pycbuf, cur);
+    return cur + len + 5;
+}
+
+int find_end_of_code(unsigned* pycbuf, int cur)
 {
     cur += 17; 
-    cur += (pycbuf[cur+1] | pycbuf[cur+2] << 8 | pycbuf[cur+3] << 16 | pycbuf[cur+4] << 24) + 5;
-    int n_const = pycbuf[cur+1] | pycbuf[cur+2] << 8 | pycbuf[cur+3] << 16 | pycbuf[cur+4] << 24;
+    cur = skip_element(pycbuf, cur); 
+    int n_const = length(pycbuf, cur);
     cur += 5;
     while(n_const--) 
     {
-        if(pycbuf[cur] == 69)
+        if (pycbuf[cur] == TYPE_INTEGER)
             cur += 5;
-        else if(pycbuf[cur] == TYPE_NONE)
+        else if (pycbuf[cur] == TYPE_NONE)
             cur += 1;
-        else if(pycbuf[cur] == TYPE_CODE)
-            cur = pos(pycbuf, cur);
+        else if (pycbuf[cur] == TYPE_CODE)
+            cur = find_end_of_code(pycbuf, cur);
         else 
             cur++;
     }
     n_const = 0;
     while(1) 
     {
-            if(pycbuf[cur] == 28)
+            if (pycbuf[cur] == TYPE_TUPLE)
                 n_const++;
-            if(n_const == 4)
+            if (n_const == 4)
                 break;
             cur++; 
     }
     cur += 5;
-    cur += (pycbuf[cur+1] | pycbuf[cur+2] << 8 | pycbuf[cur+3] << 16 | pycbuf[cur+4] << 24) + 5;
-    cur += (pycbuf[cur+1] | pycbuf[cur+2] << 8 | pycbuf[cur+3] << 16 | pycbuf[cur+4] << 24) + 5;
+    cur = skip_element(pycbuf, cur);
+    cur = skip_element(pycbuf, cur);
     cur += 4;
-    cur += (pycbuf[cur+1] | pycbuf[cur+2] << 8 | pycbuf[cur+3] << 16 | pycbuf[cur+4] << 24) + 5;
+    cur = skip_element(pycbuf, cur);
     return cur;
 }
 
 int get_consts(unsigned* pycbuf, struct code_obj* pobj, int cur, int size)
 {
-    int no_consts = pycbuf[cur+1] | pycbuf[cur+2] << 8 | pycbuf[cur+3] << 16 | pycbuf[cur+4] << 24; 
-    int count = 0;
+    int num_co = length(pycbuf, cur);
+    int i = 0;
     cur += 5;
-    while(count < no_consts) 
+    while(i < num_co) 
     {
-        if(pycbuf[cur] == 69) 
+        if (pycbuf[cur] == TYPE_INTEGER) 
 	{ 
-	    int l = pycbuf[cur+1] | pycbuf[cur+2] << 8 | pycbuf[cur+3] << 16 | pycbuf[cur+4] << 24;
-            store_val(&(pobj->consts),l);
+            field_add(&(pobj->consts), length(pycbuf, cur));
             cur += 5;
         }
         else if(pycbuf[cur] == TYPE_NONE)
 	{
-            store_val(&(pobj->consts),0);
+            field_add(&(pobj->consts), 0);
             cur += 1;
-        }
+        } 
 	else if(pycbuf[cur] == TYPE_CODE) 
 	{
-            store_val(&(pobj->consts),0);
-            cur = pos(pycbuf, cur);
+            field_add(&(pobj->consts), 0);
+            cur = find_end_of_code(pycbuf, cur);
         }
-        count++;
+        i++;
     }
     return cur; 
 }
 
+void copy(char* s, unsigned* pycbuf, int cur, int length)
+{
+    while(length--) 
+    {
+        *s = pycbuf[cur++];
+        s++;
+    }
+    *s = '\0';
+}
+
 int get_names(unsigned* pycbuf, struct code_obj* pobj, int cur)
 {
-    int n_names = pycbuf[cur+1] | pycbuf[cur+2] << 8 | pycbuf[cur+3] << 16 | pycbuf[cur+4] << 24;
+    int n_names = length(pycbuf, cur);
     int func_idx = 0;
     struct obj* ptrobj;
     cur += 5;
@@ -179,22 +231,14 @@ int get_names(unsigned* pycbuf, struct code_obj* pobj, int cur)
         if (pycbuf[cur] == TYPE_INTERN) 
 	{
             ptrobj = malloc(sizeof *ptrobj);
-           // copy(ptrobj->name,pycbuf,cur+5,length(pycbuf,cur));
-	    char *s = ptrobj->name;
-	    int l = pycbuf[cur+1] | pycbuf[cur+2] << 8 | pycbuf[cur+3] << 16 | pycbuf[cur+4] << 24;
-	    while(l--)
-	    {
-		*s = pycbuf[cur++];
-		s++;
-	    }
-	    *s = '\0';
+            copy(ptrobj->name, pycbuf, cur+5, length(pycbuf, cur));
             objects[obj_cnt++] = ptrobj;             
             pobj->names[pobj->name_cnt++] = ptrobj; 
-            cur += (pycbuf[cur+1] | pycbuf[cur+2] << 8 | pycbuf[cur+3] << 16 | pycbuf[cur+4] << 24) + 5;
+            cur = skip_element(pycbuf, cur);
         } 
-	else if (pycbuf[cur] == TYPE_SREF) 
+	else if(pycbuf[cur] == TYPE_SREF) 
 	{
-            func_idx = pycbuf[cur+1] | pycbuf[cur+2] << 8 | pycbuf[cur+3] << 16 | pycbuf[cur+4] << 24;
+            func_idx = length(pycbuf, cur);
             ptrobj = pobj->names[pobj->name_cnt++] = objects[func_idx];
             cur += 5;
         } 
@@ -207,30 +251,18 @@ int get_names(unsigned* pycbuf, struct code_obj* pobj, int cur)
 int get_varnames(unsigned* pycbuf, struct code_obj* pobj, int cur)
 {
     struct obj* ptrobj;
-    int n_varnames = (pobj->varnames).length = pycbuf[cur+1] | pycbuf[cur+2] << 8 | pycbuf[cur+3] << 16 | pycbuf[cur+4] << 24;
+    int n_varnames = (pobj->varnames).length = length(pycbuf, cur);
     cur += 5;
-    while(n_varnames--) 
-    {
-        if (pycbuf[cur] == TYPE_INTERN) 
-	{
+    while(n_varnames--) {
+        if (pycbuf[cur] == TYPE_INTERN) {
             ptrobj = init_obj();
-            //copy(ptrobj->name, pycbuf, cur+5, length(pycbuf, cur));
-	    char *s = ptrobj->name;
-	    int l = pycbuf[cur+1] | pycbuf[cur+2] << 8 | pycbuf[cur+3] << 16 | pycbuf[cur+4] << 24;
-	    while(l--)
-	    {
-		*s = pycbuf[cur++];
-		s++;
-	    }
-	    *s = '\0';
-            objects[obj_cnt++] = ptrobj;        
-            cur += (pycbuf[cur+1] | pycbuf[cur+2] << 8 | pycbuf[cur+3] << 16 | pycbuf[cur+4] << 24) + 5;
-        } 
-	else if (pycbuf[cur] == TYPE_SREF) 
-	{
+            copy(ptrobj->name, pycbuf, cur+5, length(pycbuf, cur));
+            objects[obj_cnt++] = ptrobj;
+        
+            cur = skip_element(pycbuf,  cur);
+        } else if (pycbuf[cur] == TYPE_SREF) {
             cur += 5;
-        } 
-	else
+        } else
             cur++;
     }
     return cur;
@@ -238,32 +270,27 @@ int get_varnames(unsigned* pycbuf, struct code_obj* pobj, int cur)
 
 int code_name(unsigned* pycbuf, struct code_obj* pobj, int cur)
 {
-    int n_field = 0,ret;
+    int n_field = 0;
     struct obj* ptrobj;
-    while(1) 
-    {
-            if (pycbuf[cur] == 28)
+    while(1) {
+            if (pycbuf[cur] == TYPE_TUPLE)
                 n_field++;
             if (n_field == 2)
                 break;
             cur++; 
     }
-    cur += 5;
-    cur += (pycbuf[cur+1] | pycbuf[cur+2] << 8 | pycbuf[cur+3] << 16 | pycbuf[cur+4] << 24) + 5;
+    cur += 5; 
+    cur = skip_element(pycbuf, cur);
     if (pycbuf[cur] == TYPE_INTERN) 
     {
         ptrobj = init_obj();
-	int l = pycbuf[cur+1] | pycbuf[cur+2] << 8 | pycbuf[cur+3] << 16 | pycbuf[cur+4] << 24;
- 	// copying to name
-        strncpy(ptrobj->name,(char *)&pycbuf[cur+5],l+1);
+        strncpy(ptrobj->name, (char *) &pycbuf[cur+5], length(pycbuf, cur)+1);
         objects[obj_cnt++] = ptrobj;
         pobj->name = ptrobj->name;
         return obj_cnt-1;
-
-    } 
+    }
     else 
-        ret = pycbuf[cur+1] | pycbuf[cur+2] << 8 | pycbuf[cur+3] << 16 | pycbuf[cur+4] << 24;
-	return ret;
+        return length(pycbuf, cur);
 }
 
 int read_code(unsigned* pycbuf, struct code_obj* pobj, int cur, int size)
